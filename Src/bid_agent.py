@@ -14,7 +14,7 @@ import sys
 
 # 將專案根目錄加入 path，以便 import policy
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from policy import BiddingModel
+from Src.bidding_model import BiddingModel
 
 
 class BidAgent:
