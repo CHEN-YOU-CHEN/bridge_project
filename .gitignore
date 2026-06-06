@@ -1,0 +1,15 @@
+# 排除 Python 虛擬環境 (重要！)
+venv/
+.venv/
+env/
+
+# 排除所有原始牌譜與模型權重資料夾
+Data/
+
+# 排除 Python 編譯暫存檔
+__pycache__/
+*.pyc
+
+# 排除預訓練權重
+*.pth
+*.pt
