@@ -1,26 +1,73 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import os
-from Src.model import BridgePolicyNet
 from Src.utils import CARD_TO_IDX, IDX_TO_CARD, get_legal_mask
+from Src.model import BridgePolicyNet, BridgePolicyNetResNet, LegacyPolicyNet
+
+
+
+# 可用模型清單：(顯示名稱, 模型路徑, 架構類別, 建構參數)
+MODEL_OPTIONS = [
+    ("【監督學習 Legacy】policy_165dim_best  ← 人類棋譜訓練 (MLP)",
+     "Data/models/policy_165dim_best.pth",
+     LegacyPolicyNet,
+     {"input_dim": 165}),
+    ("【監督學習 ResNet】policy_resnet_best  ← 人類棋譜訓練 (ResNet)",
+     "Data/models/policy_resnet_best.pth",
+     BridgePolicyNetResNet,
+     {"input_dim": 165, "hidden_dim": 512, "output_dim": 52, "num_blocks": 4}),
+    ("【強化學習 Mix RL】playing_rl_mix_best  ← Legacy 監督模型出發 PPO",
+     "Data/models/playing_rl_mix_best.pth",
+     LegacyPolicyNet,
+     {"input_dim": 165}),
+    ("【強化學習 Pure RL】playing_rl_pure_best  ← Legacy 隨機初始化 PPO",
+     "Data/models/playing_rl_pure_best.pth",
+     LegacyPolicyNet,
+     {"input_dim": 165}),
+    ("【強化學習 ResNet Mix RL】playing_rl_resnet_mix_best  ← ResNet 監督模型出發 PPO",
+     "Data/models/playing_rl_resnet_mix_best.pth",
+     BridgePolicyNetResNet,
+     {"input_dim": 165, "hidden_dim": 512, "output_dim": 52, "num_blocks": 4}),
+    ("【強化學習 ResNet Pure RL】playing_rl_resnet_pure_best  ← ResNet 隨機初始化 PPO",
+     "Data/models/playing_rl_resnet_pure_best.pth",
+     BridgePolicyNetResNet,
+     {"input_dim": 165, "hidden_dim": 512, "output_dim": 52, "num_blocks": 4}),
+]
+
 
 def run_session():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_path = "Data/models/policy_165dim_best.pth" # 建議讀取你剛剛存的最佳版本
-    
+    # --- 0. 選擇模型 ---
+    print("\n" + "="*40)
+    print("       橋牌 AI 連續對局助手        ")
+    print("="*40)
+    print("\n[選擇模型] 請選擇要使用的 AI 模型：")
+    for i, (name, path, _, _) in enumerate(MODEL_OPTIONS):
+        exists = "✓" if os.path.exists(path) else "✗ 找不到"
+        print(f"  {i+1}. [{exists}] {name}")
+    try:
+        choice = int(input(">> ")) - 1
+        if not (0 <= choice < len(MODEL_OPTIONS)):
+            raise ValueError
+    except (ValueError, TypeError):
+        print("輸入無效，預設使用監督預訓練模型。")
+        choice = 0
+
+    model_name, model_path, ModelClass, model_kwargs = MODEL_OPTIONS[choice]
+
     if not os.path.exists(model_path):
         print(f"錯誤：找不到模型 {model_path}")
         return
 
-    model = BridgePolicyNet(input_dim=165).to(device)
+    model = ModelClass(**model_kwargs).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
+    print(f" 已載入模型：{model_name}")
 
-    print("\n" + "="*40)
-    print("       橋牌 AI 連續對局助手        ")
-    print("="*40)
+
 
     # --- 1. 初始化對局狀態 ---
     print("\n[初始化] 請輸入原始 13 張手牌:")
@@ -38,9 +85,11 @@ def run_session():
     t_idx = t_map.get(t_input, 4)
 
     full_history = []
+    trick_num = 0  # 目前第幾輪
 
     # --- 2. 進入對局循環 ---
     while len(current_hand) > 0:
+        trick_num += 1
         print("\n" + "-"*40)
         print(f"目前剩餘手牌: {[IDX_TO_CARD[i] for i in sorted(current_hand)]}")
         if len(dummy_hand) > 0:
@@ -123,6 +172,29 @@ def run_session():
             print(f" 已從手牌移除 {played_card}，並加入歷史紀錄。")
         else:
             print(" 警告：輸入的牌不在手牌中，狀態未更新。")
+
+        # --- 6.5. 第一輪出牌後：若夢家尚未亮牌，立即輸入夢家手牌 ---
+        # 橋牌規則：首攻出牌後，夢家手牌攤開在桌上
+        if trick_num == 1 and len(dummy_hand) == 0:
+            print("\n[夢家亮牌] 首攻後夢家攤牌，請輸入夢家的 13 張牌:")
+            dummy_input = input(">> ").upper().split()
+            dummy_hand = [CARD_TO_IDX.get(c) for c in dummy_input if CARD_TO_IDX.get(c) is not None]
+            print(f" 夢家手牌已記錄：{[IDX_TO_CARD[i] for i in sorted(dummy_hand)]}")
+
+        # --- 7. 輸入我出牌之後本輪剩餘的牌 ---
+        # 若使用者不是最後一個出牌 (順位 < 4)，本輪還有其他人的牌尚未記錄
+        remaining_in_trick = 4 - pos_input  # 我之後還有幾個人出牌
+        if remaining_in_trick > 0:
+            print(f"\n[輸入] 請輸入「我出牌之後」本輪剩餘的 {remaining_in_trick} 張牌 (例如: AH KS)：")
+            after_cards = input(">> ").upper().split()
+            for c in after_cards:
+                idx = CARD_TO_IDX.get(c)
+                if idx is not None:
+                    full_history.append(idx)
+                    # 如果是夢家出的牌，從夢家手牌扣除
+                    if idx in dummy_hand:
+                        dummy_hand.remove(idx)
+            print(f" 本輪結束，已記錄 {len(after_cards)} 張後續牌。")
 
         if input("\n繼續下一輪？ (y/n): ").lower() != 'y': break
 
