@@ -32,7 +32,7 @@
 
 本專題採用雙模型架構：
 1. **叫牌模型** — `BiddingModel`：以監督式學習從真實牌譜中學習叫牌策略。
-2. **打牌模型** — `BridgePolicyNet`：先以監督式學習預訓練，再以 **PPO（Proximal Policy Optimization）** 強化學習微調，達成最大化合約完成率的目標。
+2. **打牌模型** — `BridgePolicyNet` / `BridgePolicyNetResNet`：先以監督式學習預訓練，再以 **PPO（Proximal Policy Optimization）** 強化學習微調，達成最大化取磴數的目標。
 
 ---
 
@@ -42,24 +42,28 @@
 BBO 牌譜 (.lin)
     │
     ▼
-Src/dataset.py         ← 解析 LIN 格式，生成 165 維狀態向量
+Src/dataset.py              ← 解析 LIN 格式，生成 165 維狀態向量
     │
     ▼
 Data/processed/bridge_dataset.pt   ← 預處理後的訓練集（PyTorch 張量）
     │
-    ├──► train.py                  ← 監督式學習，訓練打牌模型
-    │        └── BridgePolicyNet   ← 存入 policy_165dim_best.pth
+    ├──► train_playing_sl.py        ← 監督式學習，訓練打牌模型
+    │        ├── --model legacy     → policy_165dim_best.pth  (BridgePolicyNet)
+    │        └── --model resnet     → policy_resnet_best.pth  (BridgePolicyNetResNet)
     │
-    ├──► Src/bidding_model.py      ← 監督式學習，訓練叫牌模型
-    │        └── BiddingModel      ← 存入 bidding_model.pth
+    ├──► Src/bidding_model.py       ← 監督式學習，訓練叫牌模型
+    │        └── BiddingModel       → bidding_model.pth
     │
-    └──► train_playing_rl.py       ← PPO 強化學習，微調打牌模型
-             ├── BridgePolicyNet (Actor)   ← playing_rl_best.pth
-             └── PlayingValueNet (Critic)  ← playing_rl_critic.pth
+    └──► train_playing_rl.py        ← PPO 強化學習，微調打牌模型（4 種模式）
+             ├── --mode pure           → playing_rl_pure_best.pth
+             ├── --mode mix            → playing_rl_mix_best.pth
+             ├── --mode resnet_pure    → playing_rl_resnet_pure_best.pth
+             └── --mode resnet_mix     → playing_rl_resnet_mix_best.pth
 
 最終推論
-    ├── bridgeAI.py                ← 完整對局（叫牌 + 打牌雙模型）
-    └── predict_action.py          ← 互動式單步推薦工具
+    ├── bridgeAI.py           ← 完整對局（叫牌 + 打牌雙模型）
+    ├── predict_action.py     ← 互動式單步推薦工具
+    └── eval_now.py           ← 模型評估工具
 ```
 
 ---
@@ -82,11 +86,16 @@ Data/processed/bridge_dataset.pt   ← 預處理後的訓練集（PyTorch 張量
 
 ### 階段一：監督式預訓練（Imitation Learning）
 
-**打牌模型**（`train.py`）
+**打牌模型**（`train_playing_sl.py`）
 1. 載入 `bridge_dataset.pt`
 2. 90/10 分割為訓練集與驗證集
-3. 使用 **CrossEntropyLoss** 訓練 `BridgePolicyNet`（165→1024→1024→512→52）
-4. 按驗證準確率儲存最佳模型至 `Data/models/policy_165dim_best.pth`
+3. 使用 **CrossEntropyLoss** + Adam 訓練 15 個 epoch，Batch Size 2048
+4. 支援兩種模型架構，透過 `--model` 參數切換：
+
+| `--model` | 模型架構 | 輸出權重 |
+|---|---|---|
+| `legacy`（預設） | `BridgePolicyNet`（MLP，hidden=1024） | `policy_165dim_best.pth` |
+| `resnet` | `BridgePolicyNetResNet`（4 個殘差模塊，hidden=512） | `policy_resnet_best.pth` |
 
 **叫牌模型**（`Src/bidding_model.py` 中的 `main()`）
 - 使用雙分支網路：
@@ -97,25 +106,37 @@ Data/processed/bridge_dataset.pt   ← 預處理後的訓練集（PyTorch 張量
 
 ### 階段二：PPO 強化學習微調（`train_playing_rl.py`）
 
-以監督預訓練的 `policy_165dim_latest.pth` 初始化 Actor，加上從頭訓練的 Critic（`PlayingValueNet`），在完整的兩階段橋牌環境（`BridgeGymEnv`）中進行自我對弈：
+以監督預訓練的模型初始化 Actor，搭配從頭訓練的 Critic（`PlayingValueNet`），在完整的兩階段橋牌環境（`BridgeGymEnv`）中進行**非對稱自我對弈**（NS 隊使用當前 Actor，EW 隊從對手池隨機抽取歷史快照）。
+
+支援 4 種訓練模式（`--mode`）：
+
+| `--mode` | Actor 架構 | 初始化方式 |
+|---|---|---|
+| `pure` | `LegacyPolicyNet` | 隨機初始化 |
+| `mix`（預設） | `LegacyPolicyNet` | 載入 `policy_165dim_best.pth` |
+| `resnet_pure` | `BridgePolicyNetResNet` | 隨機初始化 |
+| `resnet_mix` | `BridgePolicyNetResNet` | 載入 `policy_resnet_best.pth` |
+
+**PPO 超參數**：
 
 | 超參數 | 值 |
 |---|---|
-| 總對局數 | 50,000 |
-| 每批局數（Batch） | 64 |
-| PPO Epochs | 4 |
-| Mini-batch 大小 | 512 |
+| 總對局數 | 150,000 |
+| 每批局數（Batch） | 256 |
+| PPO Epochs | 6 |
+| Mini-batch 大小 | 1024 |
 | 折扣因子 γ | 0.99 |
 | GAE λ | 0.95 |
-| PPO Clip ε | 0.2 |
-| Actor 學習率 | 1e-5 |
-| Critic 學習率 | 5e-5 |
+| PPO Clip ε | 0.15 |
+| Actor 學習率 | 5e-5 |
+| Critic 學習率 | 1.5e-4 |
 | 熵正則化係數 | 0.01 |
+| Critic Warmup | 前 300 局僅訓練 Critic |
+| 對手池大小 | 最多 20 個歷史快照 |
 
-**Reward 設計**：
-- 每磴結束：`±1.0`（莊家方視角）
-- 遊戲結束：完成合約 `+10 + 超磴 × 2`；未完成 `-(10 + 不足磴 × 3)`
-- 防守方自動翻轉 reward 方向
+**Reward 設計（稀疏獎勵）**：
+- 整局結束時，依總磴數計算：`(team_tricks - 6.5) / 6.5 × 10.0`
+- 以 6.5 磴為及格線，超過則為正獎勵，未達則為負獎勵
 
 ---
 
@@ -139,16 +160,19 @@ Data/processed/bridge_dataset.pt   ← 預處理後的訓練集（PyTorch 張量
 
 ---
 
-#### `train.py` — **打牌監督式學習訓練腳本**
-訓練 `BridgePolicyNet` 打牌模型：
+#### `train_playing_sl.py` — **打牌監督式學習訓練腳本**
+訓練打牌策略模型，支援兩種架構：
 - 載入 `Data/processed/bridge_dataset.pt`
-- 以 CrossEntropyLoss + Adam 訓練 15 個 epoch
-- Batch Size 2048，加速訓練
-- 同時儲存最佳模型（`policy_165dim_best.pth`）與每輪備份（`policy_165dim_latest.pth`）
+- 以 CrossEntropyLoss + Adam 訓練 15 個 epoch，Batch Size 2048
+- 按驗證準確率儲存最佳模型（`_best.pth`）與每輪最新版（`_latest.pth`）
 
 **執行方式**：
 ```bash
-python train.py
+# MLP 版本（預設）
+python train_playing_sl.py
+
+# ResNet 版本
+python train_playing_sl.py --model resnet
 ```
 
 ---
@@ -156,15 +180,36 @@ python train.py
 #### `train_playing_rl.py` — **打牌 PPO 強化學習訓練腳本**
 橋牌 AI 的核心強化學習訓練程式，包含：
 - `PlayingValueNet`（Critic 網路，165→512→256→128→1）
-- `collect_one_game()` — 執行一局完整遊戲，叫牌用隨機合法策略，打牌用 Actor 收集 trajectory
+- `OpponentPool` — 維護歷史 Actor 快照的對手池，實現非對稱自我對弈
+- `heuristic_bid()` — 啟發式叫牌器，依 NS 雙方配合張數自動決定合約
+- `collect_one_game_asymmetric()` — 執行單局對弈，僅收集 NS 隊軌跡
 - `compute_gae()` — 計算廣義優勢估計（GAE）
-- `compute_player_reward()` — 依玩家所在隊伍（NS/EW）轉換 reward 方向
 - `ppo_update()` — 按 mini-batch 執行 PPO 梯度更新
-- `evaluate()` — 每 500 局評估一次，莊家方使用 Actor greedy，防守方使用隨機策略
+- `evaluate()` — 每 1000 局評估一次，計算 NS 平均磴數
 
 **執行方式**：
 ```bash
+# 監督預訓練 + RL 微調（預設，MLP）
 python train_playing_rl.py
+
+# 監督預訓練 + RL 微調（ResNet）
+python train_playing_rl.py --mode resnet_mix
+
+# 純 RL 訓練（MLP，隨機初始化）
+python train_playing_rl.py --mode pure
+
+# 純 RL 訓練（ResNet，隨機初始化）
+python train_playing_rl.py --mode resnet_pure
+```
+
+---
+
+#### `eval_now.py` — **模型評估工具**
+對已訓練好的模型進行評估，輸出平均磴數等統計資料。
+
+**執行方式**：
+```bash
+python eval_now.py
 ```
 
 ---
@@ -182,25 +227,6 @@ python train_playing_rl.py
 ```bash
 python predict_action.py
 ```
-
----
-
-#### `main_random_agent.py` — **隨機代理人測試腳本**
-使用純隨機策略完整模擬一局橋牌（叫牌 + 打牌），用於：
-- 驗證 `BridgeEnv` 環境的基本功能
-- 快速觀察遊戲流程格式
-
-**執行方式**：
-```bash
-python main_random_agent.py
-```
-
----
-
-#### `run_test.py` — **Gymnasium 環境規範驗證腳本**
-使用 `gymnasium.utils.env_checker.check_env()` 驗證 `BridgeEnv` 是否符合 Gymnasium 標準介面，同時進行完整的合法動作隨機對局測試。此腳本在環境大改動後用來確保介面規範未被破壞。
-
-**注意**：腳本中引用了 `env.decode_action()` 與 `DECK` 等可能已過時的介面，主要作為開發期的回歸測試工具。
 
 ---
 
@@ -223,7 +249,6 @@ python main_random_agent.py
 - **打牌觀察**（165 維）：`[歷史出牌 52] + [自己手牌 52] + [夢家手牌 52] + [王牌 5] + [順位 4]`
 - 完整叫牌規則：Pass、有效叫牌大小限制、Double、Redouble
 - 正確莊家判定（`_find_declarer()`）：找出隊伍中最早叫出該花色的玩家
-- 打牌 Reward：每磴 ±1.0 + 遊戲結束獎懲
 - **資訊保護**：全域首攻時夢家手牌隱藏（防資訊洩漏）
 
 **全局常數**：
@@ -234,16 +259,37 @@ python main_random_agent.py
 
 #### `Src/model.py` — **打牌策略網路**
 
-**`BridgePolicyNet`**（Actor 網路）
+**`BridgePolicyNet`**（MLP Actor，Legacy 版）
 ```
 輸入 (165維)
-    → Linear(165, 1024) + BatchNorm + ReLU + Dropout(0.3)
-    → Linear(1024, 1024) + ReLU + Dropout(0.2)
-    → Linear(1024, 512) + ReLU
-    → Linear(512, 52)   ← 52 種出牌動作的 logits
+    → Linear(165, hidden_dim) + LayerNorm + ReLU
+    → Linear(hidden_dim, hidden_dim) + LayerNorm + ReLU
+    → Linear(hidden_dim, 256) + ReLU
+    → Linear(256, 52)   ← 52 種出牌動作的 logits
+    → Legal Mask        ← 從 x[52:104] 自動遮蔽非手牌
 ```
-- 內建**合法動作遮罩**：從輸入向量 `[52:104]`（自己手牌）取得遮罩，對手中沒有的牌設定 logit 為 `-1e4`
-- 同時作為監督式學習的模型（`train.py`）與 RL 的 Actor（`train_playing_rl.py`）
+- 預設 `hidden_dim=1024`（SL 訓練）
+- 內建**合法動作遮罩**：對手中沒有的牌設定 logit 為 `-1e4`
+
+**`ResBlock`**（殘差模塊）
+```
+輸入 x
+  ├─→ [Linear → LayerNorm → ReLU → Linear → LayerNorm] → F(x)
+  └─────────────────────────────────────────────────────→ x（跳接）
+輸出：ReLU(F(x) + x)
+```
+- 梯度公式：`∂H/∂x = ∂F/∂x + 1`，永遠有 +1，避免梯度消失
+
+**`BridgePolicyNetResNet`**（ResNet Actor）
+```
+165 → [輸入投影 512] → [ResBlock × 4] → [輸出頭 512→256→52]
+```
+- 4 個殘差模塊堆疊，適合深度強化學習長時間訓練
+- 每個 ResBlock 可選擇「學習改變」或「直接跳過」
+
+**`LegacyPolicyNet`**（舊版相容架構）
+- 對齊舊版 `policy_165dim_best.pth` 的 state_dict key（`fc_net.x`）
+- 包含 BatchNorm1d 與 Dropout，RL 訓練時 Dropout 層替換為 Identity
 
 ---
 
@@ -314,8 +360,6 @@ python main_random_agent.py
 - `__init__(model_path, device)` — 載入模型
 - `select_action(playing_state, legal_card_indices)` — 輸入 165 維打牌狀態與合法牌索引列表，回傳 `(card_idx, card_name, confidence)`
 
-**注意**：此類別目前引用了 `bridge_gym_env.IDX_TO_CARD`（已整合至 `Src/utils.py`），若單獨使用需確認 import 路徑。
-
 ---
 
 #### `Src/checkdata.py` — **資料集驗證工具**
@@ -347,13 +391,16 @@ Data/
 ├── processed/         ← 預處理後的訓練集
 │   └── bridge_dataset.pt    （~750MB，PyTorch 張量格式）
 └── models/            ← 訓練好的模型權重
-    ├── bidding_model.pth         （叫牌模型，~500KB）
-    ├── policy_165dim_best.pth    （打牌監督預訓練最佳版，~6.8MB）
-    ├── policy_165dim_latest.pth  （打牌監督預訓練最新版，~6.8MB）
-    ├── playing_rl_best.pth       （PPO 強化學習打牌最佳版，~6.8MB）
-    ├── playing_rl_latest.pth     （PPO 強化學習打牌最新版，~6.8MB）
-    ├── playing_rl_critic.pth     （PPO Critic 網路，~1MB）
-    └── policy_113dim.pth         （舊版 113 維輸入的打牌模型，備份用）
+    ├── bidding_model.pth              （叫牌模型，~500KB）
+    ├── policy_165dim_best.pth         （MLP 監督預訓練最佳版，~6.8MB）
+    ├── policy_165dim_latest.pth       （MLP 監督預訓練最新版，~6.8MB）
+    ├── policy_resnet_best.pth         （ResNet 監督預訓練最佳版）
+    ├── policy_resnet_latest.pth       （ResNet 監督預訓練最新版）
+    ├── playing_rl_mix_best.pth        （PPO mix 模式最佳版）
+    ├── playing_rl_mix_latest.pth      （PPO mix 模式最新版）
+    ├── playing_rl_mix_critic.pth      （PPO mix Critic 網路）
+    ├── playing_rl_resnet_mix_best.pth （PPO resnet_mix 模式最佳版）
+    └── ...                            （其他 pure / resnet_pure 模式同理）
 ```
 
 > **注意**：`Data/` 資料夾已加入 `.gitignore`，不會上傳至 Git 儲存庫。
@@ -362,19 +409,27 @@ Data/
 
 ## 6. 模型架構細節
 
-### BridgePolicyNet（打牌 Actor）
+### BridgePolicyNet（MLP Actor，SL 版）
 
 | 層 | 輸入維度 | 輸出維度 | 備註 |
 |---|---|---|---|
 | Linear | 165 | 1024 | |
-| BatchNorm1d | 1024 | 1024 | |
-| ReLU + Dropout(0.3) | — | — | |
+| LayerNorm + ReLU | 1024 | 1024 | |
 | Linear | 1024 | 1024 | |
-| ReLU + Dropout(0.2) | — | — | |
-| Linear | 1024 | 512 | |
+| LayerNorm + ReLU | 1024 | 1024 | |
+| Linear | 1024 | 256 | |
 | ReLU | — | — | |
-| Linear | 512 | 52 | 52 張牌的 logits |
+| Linear | 256 | 52 | 52 張牌的 logits |
 | Legal Mask | — | 52 | 從 x[52:104] 自動遮蔽非手牌 |
+
+### BridgePolicyNetResNet（ResNet Actor）
+
+| 區段 | 結構 | 維度 |
+|---|---|---|
+| 輸入投影 | Linear + LayerNorm + ReLU | 165 → 512 |
+| ResBlock × 4 | (Linear→LayerNorm→ReLU→Linear→LayerNorm) + skip | 512 → 512 |
+| 輸出頭 | Linear + ReLU + Linear | 512 → 256 → 52 |
+| Legal Mask | 從 x[52:104] 自動遮蔽 | — |
 
 ### BiddingModel（叫牌）
 
@@ -390,7 +445,7 @@ Data/
 
 | 層 | 維度 |
 |---|---|
-| Linear + ReLU | 165 → 512 |
+| Linear + LayerNorm + ReLU | 165 → 512 |
 | Linear + ReLU | 512 → 256 |
 | Linear + ReLU | 256 → 128 |
 | Linear | 128 → 1 |
@@ -427,8 +482,8 @@ Data/
 | **玩家表示** | 整數 0~3 | 字串 'N'/'E'/'S'/'W' |
 | **API** | Gymnasium 標準 `step()` | 分離 `step_bidding()` / `step_playing()` |
 | **觀察** | `{'observation': 165維, 'action_mask': 52維}` | `{'bidding_state': 72維, 'playing_state': 165維}` |
-| **Reward** | 相對磴數（歸一化至 -1~1） | 按磴 ±1.0 + 最終獎懲 |
-| **引用自** | `main_random_agent.py`, `run_test.py`, `bridgeAI.py` | `train_playing_rl.py` |
+| **Reward** | 相對磴數（歸一化至 -1~1） | 稀疏：遊戲結束時依總磴數計算 |
+| **引用自** | `bridgeAI.py` | `train_playing_rl.py`, `eval_now.py` |
 
 ---
 
@@ -442,13 +497,14 @@ Src/utils.py
     ├── Src/checkdata.py     (工具函式)
     └── predict_action.py    (CARD_TO_IDX, IDX_TO_CARD, get_legal_mask)
 
-Src/model.py  (BridgePolicyNet)
+Src/model.py  (BridgePolicyNet, BridgePolicyNetResNet, LegacyPolicyNet, ResBlock)
     ↑ 被引用
-    ├── train.py
-    ├── train_playing_rl.py
-    ├── bridgeAI.py
-    ├── predict_action.py
-    └── Src/play_agent.py
+    ├── train_playing_sl.py   (BridgePolicyNet, BridgePolicyNetResNet)
+    ├── train_playing_rl.py   (BridgePolicyNetResNet, LegacyPolicyNet)
+    ├── bridgeAI.py           (BridgePolicyNet)
+    ├── predict_action.py     (BridgePolicyNet)
+    ├── eval_now.py
+    └── Src/play_agent.py     (BridgePolicyNet)
 
 Src/bidding_model.py  (BiddingModel)
     ↑ 被引用
@@ -458,9 +514,8 @@ Src/bidding_model.py  (BiddingModel)
 Src/bridge_env.py  (BridgeEnv, BridgeGymEnv, BIDDING_ACTIONS)
     ↑ 被引用
     ├── bridgeAI.py              (BridgeEnv, BIDDING_ACTIONS)
-    ├── main_random_agent.py     (BridgeEnv, BIDDING_ACTIONS)
-    ├── run_test.py              (BridgeEnv)
-    └── train_playing_rl.py      (BridgeGymEnv, PLAYERS)
+    ├── train_playing_rl.py      (BridgeGymEnv, PLAYERS, BIDDING_ACTIONS)
+    └── eval_now.py              (BridgeGymEnv)
 
 Src/dataset.py  (BridgeDataset)
     ↑ 被引用
@@ -468,13 +523,14 @@ Src/dataset.py  (BridgeDataset)
 
 Data/processed/bridge_dataset.pt
     ↑ 被讀取
-    ├── train.py
+    ├── train_playing_sl.py
     └── Src/bidding_model.py (BridgeBiddingDataset)
 
 Data/models/*.pth
     ↑ 被讀取
     ├── bridgeAI.py
     ├── predict_action.py
+    ├── eval_now.py
     └── train_playing_rl.py  (載入預訓練後繼續微調)
 ```
 
@@ -512,24 +568,39 @@ python Src/dataset.py
 ### 步驟二：預訓練打牌模型（監督式學習）
 
 ```bash
-python train.py
+# MLP 版（預設）
+python train_playing_sl.py
+
+# ResNet 版
+python train_playing_sl.py --model resnet
 ```
 
-完成後生成：
+完成後生成（以 MLP 為例）：
 - `Data/models/policy_165dim_best.pth`
 - `Data/models/policy_165dim_latest.pth`
 
 ### 步驟三：PPO 強化學習微調（可選）
 
 ```bash
-python train_playing_rl.py
+# 監督預訓練 + RL 微調（MLP，推薦入門）
+python train_playing_rl.py --mode mix
+
+# 監督預訓練 + RL 微調（ResNet）
+python train_playing_rl.py --mode resnet_mix
 ```
 
-完成後生成：
-- `Data/models/playing_rl_best.pth`
-- `Data/models/playing_rl_critic.pth`
+完成後生成（以 mix 模式為例）：
+- `Data/models/playing_rl_mix_best.pth`
+- `Data/models/playing_rl_mix_latest.pth`
+- `Data/models/playing_rl_mix_critic.pth`
 
-### 步驟四：執行完整 AI 對局
+### 步驟四：評估模型
+
+```bash
+python eval_now.py
+```
+
+### 步驟五：執行完整 AI 對局
 
 ```bash
 python bridgeAI.py
